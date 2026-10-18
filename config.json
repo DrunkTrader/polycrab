@@ -1,0 +1,70 @@
+{
+  "bot": {
+    "wallets_to_track": ["0xb55fa1296e6ec55d0ce53d93b9237389f11764d4"],
+    "enable_trading": false,
+    "mock_trading": true
+  },
+  "site": {
+    "gamma_api_base": "https://gamma-api.polymarket.com",
+    "clob_api_base": "https://clob.polymarket.com",
+    "polygon_ws_url": "wss://polygon.drpc.org"
+  },
+  "strategy": {
+    "copy_strategy": "PERCENTAGE",
+    "copy_size": 20.0,
+    "trade_multiplier": 1.0,
+    "min_order_size_usd": 0.0,
+    "max_order_size_usd": 500.0,
+    "min_whale_shares_to_copy": 10.0,
+    "adaptive_threshold_usd": 1000.0,
+    "adaptive_min_percent": 5.0,
+    "adaptive_max_percent": 30.0
+  },
+  "trading": {
+    "price_buffer": 0.005,
+    "fee_rate_bps": 0,
+    "order_expiration_secs": 60
+  },
+  "risk": {
+    "large_trade_shares": 1500.0,
+    "consecutive_trigger": 2,
+    "sequence_window_secs": 30,
+    "min_depth_usd": 200.0,
+    "trip_duration_secs": 120
+  },
+  "exchange": {
+    "ctf_exchange_address": "0xe111180000d2663c0091e4f400237545b87b996b",
+    "neg_risk_exchange_address": "0xe2222d279d744050d28e00520010520000310f59",
+    "chain_id": 137,
+    "domain_name": "Polymarket CTF Exchange",
+    "domain_version": "1"
+  },
+  "filters": {
+    "_comment_mode": "Strict allowlist: when any *_allow list is non-empty, only matching markets are copied. Block lists always win.",
+    "slug_allow": [],
+    "slug_block": [],
+    "categories_allow": ["Politics", "Sports", "Crypto"],
+    "categories_block": ["Memes"],
+    "tags_allow": [],
+    "tags_block": ["satire"],
+    "per_category_max_open_usd": {
+      "Politics": 500.0,
+      "Sports": 300.0,
+      "Crypto": 400.0
+    },
+    "per_tag_max_open_usd": {}
+  },
+  "tp_sl": {
+    "enabled": true,
+    "default_take_profit_pct": 50.0,
+    "default_stop_loss_pct": 30.0,
+    "per_category_tp_pct": {
+      "Politics": 40.0,
+      "Sports": 30.0
+    },
+    "per_category_sl_pct": {
+      "Politics": 25.0
+    },
+    "poll_interval_secs": 15
+  }
+}

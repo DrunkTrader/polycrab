@@ -1,0 +1,40 @@
+name: PolyCrab Rust CI
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "config.json"
+      - "config.yaml.example"
+      - "rust-toolchain.toml"
+      - "Makefile"
+      - "Dockerfile"
+      - ".github/workflows/rust.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "config.json"
+      - "config.yaml.example"
+      - "rust-toolchain.toml"
+      - "Makefile"
+      - "Dockerfile"
+      - ".github/workflows/rust.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fetch --locked
+      - run: make fmt-check
+      - run: make test
+      - run: cargo build --locked

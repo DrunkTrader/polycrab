@@ -1,0 +1,14 @@
+.DS_Store
+/target/
+**/*.rs.bk
+
+/config.yaml
+*.log
+dist/
+coverage/
+/.env
+/.env.*
+!/.env.example
+
+# Cargo.lock IS tracked: this is a binary crate, so the lockfile is what makes
+# release builds and `cargo build --locked` reproducible across machines and CI.

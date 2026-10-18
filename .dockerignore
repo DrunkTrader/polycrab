@@ -1,0 +1,10 @@
+.git
+.github
+target
+config.yaml
+.env
+.env.*
+!.env.example
+*.log
+dist
+coverage

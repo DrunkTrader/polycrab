@@ -1,0 +1,18 @@
+# PolyCrab — credentials file.
+# Copy to `config.yaml` and fill in. NEVER commit `config.yaml`.
+# Prefer environment variables or a secrets manager in production.
+
+bot:
+  # Your trading wallet private key — 64 hex chars, no 0x prefix.
+  private_key: "0000000000000000000000000000000000000000000000000000000000000000"
+
+  # Your Polymarket proxy/funder address. Find it on polymarket.com
+  # under your profile → "Deposit" — the address USDC was sent to.
+  funder_address: "0x0000000000000000000000000000000000000000"
+
+  # Optional: pre-issued CLOB API credentials (L2 auth).
+  # Live order submission requires all three values; PolyCrab does not provision
+  # them automatically.
+  # api_key: ""
+  # api_secret: ""
+  # api_passphrase: ""

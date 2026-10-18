@@ -1,0 +1,61 @@
+[package]
+name = "polycrab"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99.0"
+license = "MIT"
+description = "PolyCrab: Rust copy trading for Polymarket."
+repository = "https://github.com/DrunkTrader/polycrab"
+readme = "README.md"
+
+[[bin]]
+name = "polycrab"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "signal", "io-util", "net", "fs"] }
+futures-util = "0.3"
+
+# HTTP / WebSocket
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Errors / logging
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Crypto / Ethereum
+alloy-primitives = { version = "0.8", features = ["serde"] }
+alloy-sol-types = "0.8"
+alloy-signer = "0.5"
+alloy-signer-local = "0.5"
+hex = "0.4"
+
+# TUI
+ratatui = "0.28"
+crossterm = "0.28"
+
+# Misc
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
