@@ -2,6 +2,14 @@
 
 PolyCrab is a Rust Polymarket copy-trading toolkit with simulated/live order execution and a terminal dashboard.
 
+## TUI panel
+
+The ratatui/crossterm dashboard surfaces session metrics, positions, health limits, copied trades, and quote activity. These screenshots show the dashboard running in simulated mode:
+
+![PolyCrab TUI overview with positions and health limits](assets/image1.png)
+
+![PolyCrab TUI activity view with copied trades and quote updates](assets/image2.png)
+
 ## Implemented features
 
 - Polygon `OrderFilled` ingestion and Gamma market metadata lookup.
