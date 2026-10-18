@@ -4,21 +4,35 @@ PolyCrab is a single asynchronous Rust process. The current runtime starts the
 Copy Trading bot either headlessly or behind the ratatui/crossterm terminal
 dashboard.
 
-```text
-Polygon WebSocket
-        │ OrderFilled logs
-        ▼
-onchain subscription → ABI parser → copy-trading pipeline
-                                      │
-                                      ├─ Gamma market cache
-                                      ├─ eligibility filters
-                                      ├─ strategy sizing
-                                      ├─ exposure + risk guard
-                                      └─ simulated order or CLOB signing/POST
-                                                   │
-                           CLOB midpoint polling ◄─┴─► in-memory positions
-                                                   │
-                                      operator event bus → terminal dashboard
+```mermaid
+flowchart TD
+    polygon["Polygon WebSocket"] -->|OrderFilled logs| subscription
+    gamma["Gamma API"] -->|Market metadata on cache miss / expiry| cache
+
+    subgraph pipeline["Copy-trading pipeline"]
+        subscription["On-chain subscription"] --> parser["ABI parser"]
+        parser -->|WhaleTrade| cache["Market cache<br/>5-minute in-memory TTL"]
+        cache --> eligibility["Eligibility filters"]
+        eligibility --> sizing["Strategy sizing"]
+        sizing --> exposure["Category / tag exposure caps"]
+        exposure --> risk["Risk guard / circuit breaker"]
+        risk --> executor["Order executor<br/>Build planned order"]
+        executor -->|Simulated by default| simulated["Record simulated order<br/>No signing or submission"]
+        executor -->|Live when explicitly enabled| live["CLOB client<br/>EIP-712 signing + L2-authenticated POST"]
+    end
+
+    simulated -->|Local entry / exit| positions["In-memory positions<br/>Current session only"]
+    live <-->|Order submission / response| clob["Polymarket CLOB"]
+    live -->|Entry / exit on HTTP success| positions
+    positions -.->|Exposure totals| exposure
+    positions -->|Open-position snapshots| monitor["Position monitor<br/>TP/SL when enabled"]
+    clob -->|CLOB midpoint polling| monitor
+    monitor -->|Simulated TP/SL exit| simulated
+    monitor -->|Live TP/SL exit| live
+
+    pipeline -.->|Runtime events| bus["Operator event bus"]
+    monitor -.->|Quotes, exits and position events| bus
+    bus -->|Snapshot| dashboard["TUI dashboard<br/>ratatui / crossterm"]
 ```
 
 ## Runtime flow
