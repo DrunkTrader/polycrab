@@ -1,6 +1,20 @@
+
 # PolyCrab
 
 PolyCrab is a Rust Polymarket copy-trading toolkit with simulated/live order execution and a terminal dashboard.
+
+---
+
+<p align="center">
+  <a href="https://www.producthunt.com/products/polycrab?embed=true&utm_source=badge-featured&utm_medium=badge&utm_campaign=badge-polycrab" target="_blank" rel="noopener noreferrer">
+    <img
+      alt="PolyCrab - Polymarket Copy Trading made easy! | Product Hunt"
+      width="250"
+      height="54"
+      src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1285287&theme=light&t=1792576883823"
+    />
+  </a>
+</p>
 
 ## TUI panel
 
