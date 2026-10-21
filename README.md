@@ -23,3 +23,13 @@ The ratatui/crossterm dashboard surfaces session metrics, positions, health limi
 - [Quick start](docs/QUICKSTART.md)
 - [Documentation index](docs/README.md)
 - [MIT License](LICENSE)
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=drunktrader%2Fpolycrab&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=drunktrader/polycrab&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=drunktrader/polycrab&type=date&theme=light&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=drunktrader/polycrab&type=date&legend=top-left" />
+ </picture>
+</a>
