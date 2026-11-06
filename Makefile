@@ -1,7 +1,10 @@
-.PHONY: test build fmt-check lint docker-build
+.PHONY: test bench build fmt-check lint docker-build
 
 test:
 	cargo test --locked --offline
+
+bench:
+	cargo bench --locked --offline
 
 build:
 	cargo build --release --locked

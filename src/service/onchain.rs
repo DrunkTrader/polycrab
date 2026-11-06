@@ -12,8 +12,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
+use tokio::time::{interval_at, timeout, Duration, Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
+
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long the socket may stay silent before we treat it as dead.
+///
+/// A filtered subscription on a single wallet is idle most of the time, so this
+/// must be far longer than the connect timeout. We keep the link proven with
+/// our own pings rather than by waiting for whale activity.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Ping cadence. Each pong resets the idle timer, so a healthy but quiet socket
+/// is never dropped, while a genuinely dead one is caught within IDLE_TIMEOUT.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct RawLog {
@@ -22,6 +36,7 @@ pub struct RawLog {
     pub data: String,
     pub tx_hash: String,
     pub block_number: u64,
+    pub log_index: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,7 +58,17 @@ pub fn spawn_subscription_with(
             if *shutdown.borrow() {
                 break;
             }
-            match run_once(&ws_url, &filter, &tx, &bus, shutdown.clone()).await {
+            match run_once(
+                &ws_url,
+                &filter,
+                &tx,
+                &bus,
+                shutdown.clone(),
+                IDLE_TIMEOUT,
+                PING_INTERVAL,
+            )
+            .await
+            {
                 Ok(()) => {
                     if *shutdown.borrow() {
                         break;
@@ -83,20 +108,23 @@ pub fn spawn_subscription_with(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_once(
     ws_url: &str,
     filter: &LogFilter,
     tx: &mpsc::Sender<RawLog>,
     bus: &OperatorBus,
     mut shutdown: watch::Receiver<bool>,
+    idle_timeout: Duration,
+    ping_interval: Duration,
 ) -> Result<()> {
     bus.publish(OperatorEvent::Connection {
         status: ConnectionStatus::Connecting,
         detail: Some(format!("connecting to {ws_url}")),
     });
     let (mut ws, _resp) = tokio::select! {
-        result = tokio_tungstenite::connect_async(ws_url) => {
-            result.context("connecting polygon ws")?
+        result = timeout(NETWORK_TIMEOUT, tokio_tungstenite::connect_async(ws_url)) => {
+            result.context("connecting polygon ws timed out")??
         }
         _ = shutdown.changed() => return Ok(()),
     };
@@ -113,7 +141,9 @@ async fn run_once(
         "params": ["logs", filter]
     });
     tokio::select! {
-        result = ws.send(Message::Text(sub_req.to_string())) => result?,
+        result = timeout(NETWORK_TIMEOUT, ws.send(Message::Text(sub_req.to_string()))) => {
+            result.context("sending polygon subscription timed out")??
+        }
         _ = shutdown.changed() => return Ok(()),
     }
     info!(
@@ -123,9 +153,20 @@ async fn run_once(
 
     let mut subscription_id = None;
     let mut notifications = 0u64;
+    let mut keepalive = interval_at(Instant::now() + ping_interval, ping_interval);
+    keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         let Some(msg) = (tokio::select! {
-            msg = ws.next() => msg,
+            _ = keepalive.tick() => {
+                timeout(NETWORK_TIMEOUT, ws.send(Message::Ping(Vec::new())))
+                    .await
+                    .context("sending polygon ping timed out")??;
+                debug!("polygon WS keepalive ping sent");
+                continue;
+            },
+            msg = timeout(idle_timeout, ws.next()) => {
+                msg.context("polygon websocket went silent (no log, pong or control frame)")?
+            },
             _ = shutdown.changed() => return Ok(()),
         }) else {
             break;
@@ -135,7 +176,9 @@ async fn run_once(
             Message::Text(t) => t,
             Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
             Message::Ping(p) => {
-                ws.send(Message::Pong(p)).await?;
+                timeout(NETWORK_TIMEOUT, ws.send(Message::Pong(p)))
+                    .await
+                    .context("sending polygon pong timed out")??;
                 continue;
             }
             Message::Close(_) => return Ok(()),
@@ -200,9 +243,14 @@ async fn run_once(
             block = log.block_number,
             "polygon log notification received"
         );
-        if tx.send(log).await.is_err() {
-            // Consumer dropped — exit cleanly.
-            return Ok(());
+        tokio::select! {
+            result = tx.send(log) => {
+                if result.is_err() {
+                    // Consumer dropped — exit cleanly.
+                    return Ok(());
+                }
+            }
+            _ = shutdown.changed() => return Ok(()),
         }
         debug!(
             notifications,
@@ -245,22 +293,113 @@ fn parse_log(v: &Value) -> Result<RawLog> {
         tx_hash: String,
         #[serde(rename = "blockNumber")]
         block_number: String,
+        #[serde(default, rename = "logIndex")]
+        log_index: Option<String>,
     }
     let shape: LogShape = serde_json::from_value(v.clone())?;
-    let block_number =
-        u64::from_str_radix(shape.block_number.trim_start_matches("0x"), 16).unwrap_or(0);
+    let block_number = parse_hex_u64(&shape.block_number, "blockNumber")?;
+    let log_index = shape
+        .log_index
+        .as_deref()
+        .map(|value| parse_hex_u64(value, "logIndex"))
+        .transpose()?;
     Ok(RawLog {
         address: shape.address.to_lowercase(),
         topics: shape.topics.into_iter().map(|t| t.to_lowercase()).collect(),
         data: shape.data,
         tx_hash: shape.tx_hash,
         block_number,
+        log_index,
     })
+}
+
+fn parse_hex_u64(value: &str, field: &str) -> Result<u64> {
+    u64::from_str_radix(value.trim_start_matches("0x"), 16)
+        .with_context(|| format!("{field} is not valid hexadecimal"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A quiet subscription must survive far longer than the idle timeout,
+    /// because our pings draw pongs that reset it. Before keepalive existed the
+    /// read timeout alone ended the connection, losing every log in the gap.
+    #[tokio::test]
+    async fn quiet_socket_survives_past_the_idle_timeout_via_keepalive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // Wait for eth_subscribe, then acknowledge it.
+            let _ = ws.next().await.unwrap().unwrap();
+            ws.send(Message::Text(
+                json!({"jsonrpc":"2.0","id":1,"result":"0xsub"}).to_string(),
+            ))
+            .await
+            .unwrap();
+
+            // Stay silent well past the client's idle timeout, answering only
+            // pings (tungstenite pongs automatically while we read).
+            let quiet = tokio::time::sleep(Duration::from_millis(900));
+            tokio::pin!(quiet);
+            loop {
+                tokio::select! {
+                    _ = &mut quiet => break,
+                    msg = ws.next() => if msg.is_none() { return },
+                }
+            }
+
+            // Only now does a real log arrive.
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"eth_subscription",
+                    "params":{"subscription":"0xsub","result":{
+                        "address":"0xABC",
+                        "topics":["0x01"],
+                        "data":"0x00",
+                        "transactionHash":"0xlate",
+                        "blockNumber":"0x10",
+                        "logIndex":"0x02"
+                    }}
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_stop, shutdown) = watch::channel(false);
+        let filter = LogFilter {
+            address: vec!["0xabc".into()],
+            topics: vec![None],
+        };
+        let worker = tokio::spawn(async move {
+            run_once(
+                &format!("ws://{address}"),
+                &filter,
+                &tx,
+                &OperatorBus::new(),
+                shutdown,
+                Duration::from_millis(300),
+                Duration::from_millis(80),
+            )
+            .await
+        });
+
+        let log = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("connection was dropped before the late log arrived")
+            .expect("sender closed without forwarding the log");
+        assert_eq!(log.tx_hash, "0xlate");
+        assert_eq!(log.block_number, 16);
+        worker.abort();
+    }
 
     #[test]
     fn accepts_subscription_ack() {
@@ -289,11 +428,50 @@ mod tests {
             "topics":["0x01"],
             "data":"0x00",
             "transactionHash":"0xtx",
-            "blockNumber":"0x10"
+            "blockNumber":"0x10",
+            "logIndex":"0x02"
         });
         let log = parse_log(&value).unwrap();
         assert_eq!(log.address, "0xabc");
         assert_eq!(log.topics, vec!["0x01"]);
         assert_eq!(log.block_number, 16);
+        assert_eq!(log.log_index, Some(2));
+    }
+
+    #[test]
+    fn rejects_malformed_block_number() {
+        let value = json!({
+            "address":"0xABC",
+            "topics":["0x01"],
+            "data":"0x00",
+            "transactionHash":"0xtx",
+            "blockNumber":"not-hex"
+        });
+        assert!(parse_log(&value).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_log_index() {
+        let value = json!({
+            "address":"0xABC",
+            "topics":["0x01"],
+            "data":"0x00",
+            "transactionHash":"0xtx",
+            "blockNumber":"0x10",
+            "logIndex":"not-hex"
+        });
+        assert!(parse_log(&value).is_err());
+    }
+
+    #[test]
+    fn allows_logs_without_log_index_for_fallback_identity() {
+        let value = json!({
+            "address":"0xABC",
+            "topics":["0x01"],
+            "data":"0x00",
+            "transactionHash":"0xtx",
+            "blockNumber":"0x10"
+        });
+        assert_eq!(parse_log(&value).unwrap().log_index, None);
     }
 }

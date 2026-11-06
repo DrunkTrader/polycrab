@@ -12,9 +12,17 @@ readme = "README.md"
 name = "polycrab"
 path = "src/main.rs"
 
+# Hand-rolled timing loops rather than a benchmark dependency: `cargo bench`
+# then needs no network and `make test --offline` keeps working. `test = false`
+# stops `cargo test` from running the timing loops as if they were tests.
+[[bench]]
+name = "hot_path"
+harness = false
+test = false
+
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "signal", "io-util", "net", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
 futures-util = "0.3"
 
 # HTTP / WebSocket
@@ -42,6 +50,9 @@ alloy-primitives = { version = "0.8", features = ["serde"] }
 alloy-sol-types = "0.8"
 alloy-signer = "0.5"
 alloy-signer-local = "0.5"
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
 hex = "0.4"
 
 # TUI
@@ -50,6 +61,9 @@ crossterm = "0.28"
 
 # Misc
 rand = "0.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "net"] }
 
 [profile.release]
 opt-level = 3

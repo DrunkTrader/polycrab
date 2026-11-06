@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(name = "polycrab")]
 #[command(about = "PolyCrab Polymarket copy-trading toolkit.", long_about = None)]
+#[command(version)]
 struct Cli {
     /// Path to public config (JSON).
     #[arg(long, default_value = "config.json")]
@@ -30,6 +31,8 @@ struct Cli {
 enum Command {
     /// Launch the operator dashboard and select a bot. (Default if no subcommand.)
     Tui,
+    /// Validate configuration and exit without connecting to external services.
+    ValidateConfig,
     /// Run a specific bot headlessly (no TUI).
     Run {
         /// Which bot to run.
@@ -70,8 +73,28 @@ async fn main() -> Result<()> {
         "configuration loaded"
     );
 
+    // `validate-config` reports on a live configuration instead of refusing to
+    // run, so an operator can check one before the gate is lifted. Every path
+    // that could actually trade still goes through the gate first.
+    if let Some(Command::ValidateConfig) = cli.command {
+        println!(
+            "configuration valid · mode={} · wallets={}",
+            if cfg.live_trading_allowed() {
+                "LIVE (disabled by safety gate)"
+            } else {
+                "SIMULATED"
+            },
+            cfg.bot.wallets_to_track.len()
+        );
+        return Ok(());
+    }
+
+    cfg.ensure_live_trading_ready()
+        .context("validating live-trading safety gate")?;
+
     match cli.command {
         Some(Command::Run { bot: kind }) => bot::run(kind, cfg).await,
         Some(Command::Tui) | None => ui::run(cfg).await,
+        Some(Command::ValidateConfig) => unreachable!("handled above"),
     }
 }

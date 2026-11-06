@@ -29,8 +29,10 @@ Leave these defaults in place while testing:
 ```
 
 Live execution requires both `enable_trading: true` and
-`mock_trading: false`. The `OrderExecutor` is the current safety boundary that
-prevents signing and posting while either flag remains restrictive.
+`mock_trading: false`, but the current binary also fails closed before worker
+startup because fill reconciliation and production depth enforcement are not
+implemented. The `OrderExecutor` and `ClobClient` retain defensive gates so
+callers cannot bypass this restriction.
 
 ## Known operational risks
 
@@ -39,7 +41,15 @@ prevents signing and posting while either flag remains restrictive.
 - A successful CLOB response is not proof that an order filled.
 - Shutdown does not cancel already submitted live orders.
 - Source sells are ignored; TP/SL midpoint polling is the configured exit path.
-- No production order-book depth provider is connected, so the configured
-  minimum-depth threshold is not enforced in the live entry path.
+- No production order-book depth provider is connected, so depth is never
+  enforced in the live entry path; live startup is blocked rather than firing
+  blind. Simulated large trades keep running without a book provider.
+- Pending live submissions are swept once they are older than the order
+  expiration plus 60 seconds, so an unknown outcome cannot block its token or
+  consume exposure caps for the rest of the session. The sweep does not confirm
+  whether the order filled — only that the venue has stopped accepting it.
+- Accepted live submissions are represented as pending metadata and never
+  create a local position on HTTP acceptance. The live path remains disabled
+  until a venue status/fill adapter can promote confirmed quantities.
 - Review Polymarket terms and applicable laws before using live funds. PolyCrab
   is not financial advice and provides no profit guarantee.

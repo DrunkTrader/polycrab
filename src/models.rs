@@ -63,32 +63,13 @@ pub struct PlannedOrder {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderType {
-    /// Fill-or-kill (Polymarket label FOK in the SDK).
-    Fak,
+    /// Fill-or-kill: the venue fills the order completely or cancels it.
+    ///
+    /// shortcut: fill-and-kill (`FAK`) would win more partial liquidity, but a
+    /// partial fill leaves the recorded position larger than the real one.
+    /// Switch to `FAK` once fill reconciliation exists; until then
+    /// all-or-nothing keeps local state honest.
+    Fok,
     /// Good-till-date — limit order with explicit expiration.
     Gtd,
-}
-
-/// Top-of-book snapshot used by the depth guard.
-#[derive(Debug, Clone, Default)]
-pub struct BookSnapshot {
-    pub bids: Vec<BookLevel>,
-    pub asks: Vec<BookLevel>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct BookLevel {
-    pub price: f64,
-    pub size: f64,
-}
-
-impl BookSnapshot {
-    /// USD-equivalent depth on a given side within `levels` from the top.
-    pub fn depth_usd(&self, side: Side, levels: usize) -> f64 {
-        let book = match side {
-            Side::Buy => &self.asks,
-            Side::Sell => &self.bids,
-        };
-        book.iter().take(levels).map(|lv| lv.price * lv.size).sum()
-    }
 }

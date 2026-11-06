@@ -95,6 +95,7 @@ mod tests {
             tags: tags.iter().map(|s| s.to_string()).collect(),
             closed: false,
             expiry: None,
+            neg_risk: false,
         }
     }
 

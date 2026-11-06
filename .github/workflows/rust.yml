@@ -28,6 +28,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -37,4 +39,5 @@ jobs:
       - run: cargo fetch --locked
       - run: make fmt-check
       - run: make test
-      - run: cargo build --locked
+      - run: make lint
+      - run: make build

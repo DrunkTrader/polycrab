@@ -37,7 +37,7 @@ The checked-in file currently contains these important values:
 | `site` | Gamma: `https://gamma-api.polymarket.com`; CLOB: `https://clob.polymarket.com`; Polygon WebSocket: `wss://polygon.drpc.org`. |
 | `strategy` | `PERCENTAGE`, `copy_size: 20.0`, multiplier `1.0`, order range `$0`–`$500`, minimum source size `10` shares. `FIXED` and `ADAPTIVE` modes are also implemented. |
 | `trading` | Price buffer `0.005`, fee rate `0` bps, order expiration `60` seconds. |
-| `risk` | Large trade threshold `1500` shares, `2` same-token large trades in `30` seconds, cooldown `120` seconds, configured minimum depth `$200`. |
+| `risk` | Large trade threshold `1500` shares, `2` same-token large trades in `30` seconds, cooldown `120` seconds. |
 | `exchange` | Polymarket CTF and negative-risk exchange addresses, Polygon chain ID `137`, and the CTF EIP-712 domain. |
 | `filters` | Categories allowlisted: Politics, Sports, Crypto; category blocklist: Memes; tag blocklist: `satire`; category caps: Politics `$500`, Sports `$300`, Crypto `$400`. |
 | `tp_sl` | Enabled; default take-profit `50%`; default stop-loss `30%`; category overrides for Politics and Sports; midpoint polling every `15` seconds. |

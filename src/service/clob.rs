@@ -12,14 +12,22 @@
 
 use crate::config::{AppConfig, ExchangeConfig};
 use crate::models::{OrderType, PlannedOrder, Side};
+use crate::utils;
 use alloy_primitives::{Address, B256, U256};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{eip712_domain, sol, Eip712Domain, SolStruct};
 use anyhow::{anyhow, Context, Result};
+use base64::{
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+    Engine as _,
+};
+use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::str::FromStr;
+use std::time::Duration;
 
 sol! {
     /// Polymarket CTF Exchange order — EIP-712 typed data.
@@ -106,8 +114,14 @@ pub struct ClobClient {
     api_passphrase: Option<String>,
 }
 
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
+
 impl ClobClient {
     pub fn new(cfg: &AppConfig) -> Result<Self> {
+        if !cfg.live_trading_allowed() {
+            anyhow::bail!("CLOB client requires an explicit live-trading request");
+        }
+        cfg.ensure_live_trading_ready()?;
         let pk = parse_private_key(&cfg.credentials.private_key).context("loading private key")?;
         let signer = PrivateKeySigner::from_bytes(&B256::from(pk))
             .context("creating EOA signer from private key")?;
@@ -123,7 +137,10 @@ impl ClobClient {
         };
 
         Ok(Self {
-            http: Client::builder().user_agent("polycrab/0.1").build()?,
+            http: Client::builder()
+                .user_agent("polycrab/0.1")
+                .timeout(NETWORK_TIMEOUT)
+                .build()?,
             clob_base: cfg.site.clob_api_base.clone(),
             signer,
             funder,
@@ -142,11 +159,14 @@ impl ClobClient {
         &self,
         planned: &PlannedOrder,
         expiration_secs: u64,
+        neg_risk: bool,
     ) -> Result<SignedOrder> {
+        let planned = utils::quantize_order(planned.clone())
+            .map_err(|error| anyhow!("invalid order before signing: {error}"))?;
         let token_id_u256 = U256::from_str(&planned.token_id)
             .map_err(|_| anyhow!("token_id must be a U256 decimal"))?;
         let (maker_amount, taker_amount) =
-            usd_and_share_amounts(planned.shares, planned.limit_price, planned.side);
+            usd_and_share_amounts(planned.shares, planned.limit_price, planned.side)?;
 
         let expiration = (chrono::Utc::now().timestamp() as u64).saturating_add(expiration_secs);
 
@@ -165,7 +185,19 @@ impl ClobClient {
             signatureType: U256::from(self.signature_type as u8),
         };
 
-        let verifying_contract = Address::from_str(&self.exchange.ctf_exchange_address)?;
+        // Neg-risk markets settle on their own exchange contract. The domain
+        // separator hashes the verifying contract, so signing a neg-risk order
+        // against the standard exchange produces a signature the venue rejects.
+        //
+        // shortcut: both domains reuse `domain_name`. Polymarket's V2 migration
+        // page only documents the differing verifyingContract; a third-party
+        // reference claims the neg-risk domain name is "Polymarket Neg Risk CTF
+        // Exchange". Confirm against the SDK before enabling live neg-risk.
+        let verifying_contract = Address::from_str(if neg_risk {
+            &self.exchange.neg_risk_exchange_address
+        } else {
+            &self.exchange.ctf_exchange_address
+        })?;
         let domain: Eip712Domain = eip712_domain! {
             name: self.exchange.domain_name.clone(),
             version: self.exchange.domain_version.clone(),
@@ -252,7 +284,7 @@ impl ClobClient {
 
         let ts = chrono::Utc::now().timestamp().to_string();
         let prehash = format!("{ts}{method}{path}{body}");
-        let signature = hmac_sha256_base64url(api_secret, &prehash);
+        let signature = hmac_sha256_base64url(api_secret, &prehash)?;
 
         Ok(vec![
             ("POLY_ADDRESS", format!("0x{:x}", self.signer.address())),
@@ -265,16 +297,18 @@ impl ClobClient {
     }
 }
 
-fn usd_and_share_amounts(shares: f64, price: f64, side: Side) -> (U256, U256) {
+fn usd_and_share_amounts(shares: f64, price: f64, side: Side) -> Result<(U256, U256)> {
     // USDC has 6 decimals on Polygon; CTF shares are also 6-decimal scaled by Polymarket.
-    let shares_units = (shares * 1_000_000.0) as u128;
-    let usd_units = ((shares * price) * 1_000_000.0) as u128;
-    match side {
+    let shares_units = utils::decimal_units(shares, 6)
+        .map_err(|error| anyhow!("invalid share amount: {error}"))?;
+    let usd_units = utils::decimal_units(shares * price, 6)
+        .map_err(|error| anyhow!("invalid USD amount: {error}"))?;
+    Ok(match side {
         // BUY: maker pays USDC, takes shares.
         Side::Buy => (U256::from(usd_units), U256::from(shares_units)),
         // SELL: maker gives shares, takes USDC.
         Side::Sell => (U256::from(shares_units), U256::from(usd_units)),
-    }
+    })
 }
 
 fn side_str(side: Side) -> &'static str {
@@ -286,7 +320,7 @@ fn side_str(side: Side) -> &'static str {
 
 fn order_type_str(t: OrderType) -> &'static str {
     match t {
-        OrderType::Fak => "FOK",
+        OrderType::Fok => "FOK",
         OrderType::Gtd => "GTD",
     }
 }
@@ -305,169 +339,126 @@ fn parse_private_key(raw: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-/// HMAC-SHA256 over `data` keyed by `secret`, returned as url-safe base64
-/// without padding — the exact format Polymarket requires.
-fn hmac_sha256_base64url(secret: &str, data: &str) -> String {
-    let mac = hmac_sha256(secret.as_bytes(), data.as_bytes());
-    base64_url_no_pad(&mac)
-}
-
-// --- minimal HMAC-SHA256 ----------------------------------------------------
-// Vendored to avoid pulling another crate solely for this. SHA-256 itself
-// comes from the std-compatible `sha2`-style impl below.
-
-fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    const BLOCK: usize = 64;
-    let mut k = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        let h = sha256(key);
-        k[..32].copy_from_slice(&h);
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] ^= k[i];
-        opad[i] ^= k[i];
-    }
-    let inner = {
-        let mut buf = Vec::with_capacity(BLOCK + msg.len());
-        buf.extend_from_slice(&ipad);
-        buf.extend_from_slice(msg);
-        sha256(&buf)
-    };
-    let mut outer = Vec::with_capacity(BLOCK + 32);
-    outer.extend_from_slice(&opad);
-    outer.extend_from_slice(&inner);
-    sha256(&outer)
-}
-
-fn sha256(input: &[u8]) -> [u8; 32] {
-    // Minimal SHA-256 (FIPS-180-4) — small and dependency-free.
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let mut h = [
-        0x6a09e667u32,
-        0xbb67ae85,
-        0x3c6ef372,
-        0xa54ff53a,
-        0x510e527f,
-        0x9b05688c,
-        0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    // Pre-processing
-    let bit_len = (input.len() as u64) * 8;
-    let mut padded = Vec::with_capacity(input.len() + 72);
-    padded.extend_from_slice(input);
-    padded.push(0x80);
-    while padded.len() % 64 != 56 {
-        padded.push(0);
-    }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-
-    for chunk in padded.chunks(64) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let mut a = h[0];
-        let mut b = h[1];
-        let mut c = h[2];
-        let mut d = h[3];
-        let mut e = h[4];
-        let mut f = h[5];
-        let mut g = h[6];
-        let mut hh = h[7];
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ (!e & g);
-            let temp1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
-    }
-    let mut out = [0u8; 32];
-    for i in 0..8 {
-        out[i * 4..i * 4 + 4].copy_from_slice(&h[i].to_be_bytes());
-    }
-    out
-}
-
-fn base64_url_no_pad(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
-        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
-        out.push(ALPHABET[(n & 0x3f) as usize] as char);
-        i += 3;
-    }
-    let rem = data.len() - i;
-    if rem == 1 {
-        let n = (data[i] as u32) << 16;
-        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-    } else if rem == 2 {
-        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
-        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
-    }
-    out
+/// HMAC-SHA256 over `data`, keyed by the *decoded* API secret and returned as
+/// url-safe base64 with padding.
+///
+/// Both details are load-bearing and match `py-clob-client`'s
+/// `build_hmac_signature`: the stored secret is url-safe base64, so its decoded
+/// bytes are the key, and the digest keeps its `=` padding. Keying with the raw
+/// secret text, or stripping the padding, yields 401 Unauthorized.
+fn hmac_sha256_base64url(secret: &str, data: &str) -> Result<String> {
+    let key = URL_SAFE
+        .decode(secret)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(secret))
+        .map_err(|e| anyhow!("api_secret is not url-safe base64: {e}"))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&key).expect("HMAC accepts keys of every length");
+    mac.update(data.as_bytes());
+    Ok(URL_SAFE.encode(mac.finalize().into_bytes()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn test_client(clob_base: String) -> ClobClient {
+        let cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        ClobClient {
+            http: Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+            clob_base,
+            signer: PrivateKeySigner::from_bytes(&B256::from([0x11; 32])).unwrap(),
+            funder: Address::ZERO,
+            exchange: cfg.exchange,
+            fee_rate_bps: cfg.trading.fee_rate_bps,
+            signature_type: SignatureType::Eoa,
+            api_key: Some("test-key".into()),
+            // Polymarket issues the L2 secret as base64, and signing keys on
+            // its decoded bytes, so the fixture must be decodable too.
+            api_secret: Some("dGVzdC1zZWNyZXQ=".into()),
+            api_passphrase: Some("test-passphrase".into()),
+        }
+    }
+
+    fn test_order() -> SignedOrder {
+        SignedOrder {
+            salt: "1".into(),
+            maker: "0x0000000000000000000000000000000000000000".into(),
+            signer: "0x0000000000000000000000000000000000000000".into(),
+            taker: "0x0000000000000000000000000000000000000000".into(),
+            token_id: "123".into(),
+            maker_amount: "1000000".into(),
+            taker_amount: "2000000".into(),
+            side: "BUY".into(),
+            expiration: "1".into(),
+            nonce: "0".into(),
+            fee_rate_bps: "0".into(),
+            signature_type: 0,
+            signature: "0x00".into(),
+        }
+    }
+
+    async fn clob_fixture(status: &str, body: &str) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let body = body.to_string();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        (format!("http://{address}"), task)
+    }
+
+    /// Await the fixture's captured request with a bound. If `post_order` fails
+    /// before sending anything the server waits forever, which would hang the
+    /// suite instead of failing it.
+    async fn captured_request(server: tokio::task::JoinHandle<Vec<u8>>) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("fixture server never received a complete request")
+            .unwrap()
+    }
 
     #[test]
     fn sha256_known_vectors() {
         // "abc" → ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
-        let h = sha256(b"abc");
+        let h = Sha256::digest(b"abc");
         assert_eq!(
             hex::encode(h),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -477,19 +468,135 @@ mod tests {
     #[test]
     fn base64url_round_trip_known() {
         // RFC 4648 §10 test vector: f → "Zg" (no padding)
-        assert_eq!(base64_url_no_pad(b"f"), "Zg");
-        assert_eq!(base64_url_no_pad(b"fo"), "Zm8");
-        assert_eq!(base64_url_no_pad(b"foo"), "Zm9v");
+        assert_eq!(URL_SAFE_NO_PAD.encode(b"f"), "Zg");
+        assert_eq!(URL_SAFE_NO_PAD.encode(b"fo"), "Zm8");
+        assert_eq!(URL_SAFE_NO_PAD.encode(b"foo"), "Zm9v");
+    }
+
+    /// Pins the two details that make L2 auth work: the key is the *decoded*
+    /// secret, and the signature keeps its base64 padding.
+    #[test]
+    fn l2_signature_keys_on_the_decoded_secret_and_keeps_padding() {
+        let secret = "c2VjcmV0"; // url-safe base64 of "secret"
+        let message = "1700000000POST/order{}";
+
+        let mut expected = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
+        expected.update(message.as_bytes());
+        let expected = URL_SAFE.encode(expected.finalize().into_bytes());
+
+        let actual = hmac_sha256_base64url(secret, message).unwrap();
+        assert_eq!(actual, expected);
+        assert!(actual.ends_with('='), "padding must be preserved: {actual}");
+
+        // Regression guard: keying on the raw secret text is the old bug.
+        let mut raw = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        raw.update(message.as_bytes());
+        assert_ne!(actual, URL_SAFE.encode(raw.finalize().into_bytes()));
+    }
+
+    #[test]
+    fn unpadded_secret_is_still_accepted() {
+        assert!(hmac_sha256_base64url("c2VjcmV0cw", "msg").is_ok());
+    }
+
+    #[tokio::test]
+    async fn neg_risk_orders_sign_against_the_neg_risk_exchange() {
+        let client = test_client("http://127.0.0.1:1".into());
+        let planned = PlannedOrder {
+            venue: crate::models::VenueId::Polymarket,
+            token_id: "123".into(),
+            side: Side::Buy,
+            shares: 10.0,
+            limit_price: 0.5,
+            usd_notional: 5.0,
+            order_type: OrderType::Fok,
+            source_trade_hash: None,
+            source_shares: None,
+            source_usd_notional: None,
+            source_maker: None,
+            observed_at: None,
+        };
+
+        let standard = client
+            .build_signed_order(&planned, 60, false)
+            .await
+            .unwrap();
+        let neg_risk = client.build_signed_order(&planned, 60, true).await.unwrap();
+
+        assert_ne!(
+            client.exchange.ctf_exchange_address.to_lowercase(),
+            client.exchange.neg_risk_exchange_address.to_lowercase(),
+            "fixture must use two distinct exchanges for this to prove anything"
+        );
+        // Same order, different verifying contract ⇒ different domain
+        // separator ⇒ different signature.
+        assert_ne!(standard.signature, neg_risk.signature);
     }
 
     #[test]
     fn hmac_rfc4231_test_1() {
         // RFC 4231 §4.2 — HMAC-SHA-256 of "Hi There" with 20×0x0b key.
         let key = vec![0x0bu8; 20];
-        let mac = hmac_sha256(&key, b"Hi There");
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key).unwrap();
+        mac.update(b"Hi There");
+        let mac = mac.finalize().into_bytes();
         assert_eq!(
             hex::encode(mac),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
+    }
+
+    #[tokio::test]
+    async fn post_order_sends_l2_headers_and_order_type() {
+        let (base, server) =
+            clob_fixture("200 OK", r#"{"orderID":"order-1","success":true}"#).await;
+        let response = test_client(base)
+            .post_order(test_order(), OrderType::Fok)
+            .await
+            .unwrap();
+        let request = String::from_utf8(captured_request(server).await).unwrap();
+        let request = request.to_ascii_lowercase();
+
+        assert_eq!(response.order_id.as_deref(), Some("order-1"));
+        assert!(request.starts_with("post /order "));
+        for header in [
+            "poly_address:",
+            "poly_signature:",
+            "poly_timestamp:",
+            "poly_api_key:",
+            "poly_passphrase:",
+        ] {
+            assert!(request.contains(header), "missing {header}");
+        }
+        assert!(request.contains("\"ordertype\":\"fok\""));
+        assert!(request.contains("\"tokenid\":\"123\""));
+    }
+
+    #[tokio::test]
+    async fn post_order_rejects_non_success_http() {
+        let (base, server) = clob_fixture("502 Bad Gateway", "upstream down").await;
+        let error = test_client(base)
+            .post_order(test_order(), OrderType::Fok)
+            .await
+            .unwrap_err()
+            .to_string();
+        let _ = captured_request(server).await;
+        assert!(error.contains("HTTP 502"));
+    }
+
+    #[tokio::test]
+    async fn post_order_preserves_success_false_response() {
+        let (base, server) = clob_fixture(
+            "200 OK",
+            r#"{"success":false,"errorMsg":"not enough balance"}"#,
+        )
+        .await;
+        let response = test_client(base)
+            .post_order(test_order(), OrderType::Fok)
+            .await
+            .unwrap();
+        let _ = captured_request(server).await;
+        assert!(!response.success);
+        assert_eq!(response.error_msg.as_deref(), Some("not enough balance"));
     }
 }

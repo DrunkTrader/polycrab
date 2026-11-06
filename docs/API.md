@@ -15,6 +15,10 @@ PolyCrab sends `eth_subscribe` for `logs` with filters for:
 
 The subscription reconnects with backoff when the connection ends. Raw logs are
 decoded by [`src/service/parse.rs`](../src/service/parse.rs) into `WhaleTrade`.
+`transactionHash` plus `logIndex` is retained as the event identity and a
+bounded session cache suppresses duplicate deliveries. The current provider
+adapter does not backfill a missed block range after reconnect, so events in a
+disconnect gap remain an explicit at-most-once loss boundary.
 
 ## Gamma market metadata
 
@@ -37,7 +41,9 @@ GET https://clob.polymarket.com/midpoint?token_id=<token-id>
 ```
 
 The base URL is configurable through `site.clob_api_base`. Midpoints are used
-for session-local P&L and exit decisions; they are not account fills.
+for session-local P&L and exit decisions; they are not account fills. The
+response must contain a finite numeric midpoint; invalid or non-finite values
+are rejected.
 
 ## CLOB order submission
 

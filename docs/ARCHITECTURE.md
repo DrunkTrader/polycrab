@@ -18,12 +18,12 @@ flowchart TD
         exposure --> risk["Risk guard / circuit breaker"]
         risk --> executor["Order executor<br/>Build planned order"]
         executor -->|Simulated by default| simulated["Record simulated order<br/>No signing or submission"]
-        executor -->|Live when explicitly enabled| live["CLOB client<br/>EIP-712 signing + L2-authenticated POST"]
+        executor -->|Live request currently fail-closed| live["CLOB client<br/>EIP-712 signing + L2-authenticated POST"]
     end
 
     simulated -->|Local entry / exit| positions["In-memory positions<br/>Current session only"]
     live <-->|Order submission / response| clob["Polymarket CLOB"]
-    live -->|Entry / exit on HTTP success| positions
+    live -->|Confirmed fills only| positions
     positions -.->|Exposure totals| exposure
     positions -->|Open-position snapshots| monitor["Position monitor<br/>TP/SL when enabled"]
     clob -->|CLOB midpoint polling| monitor
@@ -74,8 +74,18 @@ flowchart TD
 - There is no database, account-balance reader, fill/status reconciliation, or
   local HTTP server.
 - Source sells are ignored; TP/SL is the configured exit path.
-- The configured depth threshold is covered by risk-module tests, but no
-  production order-book provider is connected. When a large trade requests a
-  book check, the executor logs a warning and continues.
+- WebSocket events are deduplicated by transaction/log identity within a
+  bounded session window. The subscription is held open with 30-second pings
+  and a 90-second idle timeout, so a quiet wallet is not mistaken for a dead
+  socket. Reconnect backfill is still not implemented, so a genuine disconnect
+  can lose events.
+- There is no order-book depth provider. A large trade is reported as
+  `RiskCheck::DepthUnverified`: simulated mode continues, and a live request is
+  blocked before signing.
+- Positions whose market has expired, or whose midpoint stops quoting for five
+  consecutive polls, are released by the monitor so their exposure returns to
+  the caps. A live position is escalated to the operator instead.
 - A successful CLOB HTTP response means submission was accepted by the HTTP
-  endpoint; it is not confirmation of an exchange fill.
+  endpoint; it is not confirmation of an exchange fill. Accepted live orders
+  are retained as pending metadata, and the binary currently refuses live
+  startup until fill reconciliation is implemented.

@@ -29,7 +29,6 @@
     "large_trade_shares": 1500.0,
     "consecutive_trigger": 2,
     "sequence_window_secs": 30,
-    "min_depth_usd": 200.0,
     "trip_duration_secs": 120
   },
   "exchange": {
@@ -37,7 +36,7 @@
     "neg_risk_exchange_address": "0xe2222d279d744050d28e00520010520000310f59",
     "chain_id": 137,
     "domain_name": "Polymarket CTF Exchange",
-    "domain_version": "1"
+    "domain_version": "2"
   },
   "filters": {
     "_comment_mode": "Strict allowlist: when any *_allow list is non-empty, only matching markets are copied. Block lists always win.",

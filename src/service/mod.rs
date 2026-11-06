@@ -1,7 +1,7 @@
 //! Shared services used by the current copy-trading bot:
 //!
 //! - [`strategy`]         — copy-sizing strategies (percentage / fixed / adaptive)
-//! - [`risk_guard`]       — circuit breaker + depth check
+//! - [`risk_guard`]       — large-trade circuit breaker
 //! - [`market_cache`]     — slug ↔ CLOB token-id ↔ category/tags resolution
 //! - [`onchain`]          — Polygon WebSocket subscription
 //! - [`parse`]            — ABI log decoding for Polymarket exchange events
@@ -10,7 +10,7 @@
 //! - [`eligibility`]      — allowlist/blocklist filter for slugs, categories, tags
 //! - [`position_store`]   — open-position tracking + exposure totals
 //! - [`midprice`]         — `/midpoint` HTTP client
-//! - [`position_monitor`] — TP/SL polling loop, posts exit FAKs through the CLOB
+//! - [`position_monitor`] — TP/SL polling loop, posts exit FOKs through the CLOB
 
 pub mod clob;
 pub mod eligibility;
