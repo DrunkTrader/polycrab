@@ -6,6 +6,7 @@
 *.log
 dist/
 coverage/
+graphify-out/
 /.env
 /.env.*
 !/.env.example
