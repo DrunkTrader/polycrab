@@ -184,6 +184,7 @@ mod tests {
             data: format!("0x{data}"),
             tx_hash: "0xtest".into(),
             block_number: 1,
+            log_index: None,
         }
     }
 

@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-// ponytail: std locks trade parking_lot's non-poisoning behavior for zero direct lock dependency; recover poison or restore it if panic isolation matters.
+// ponytail: poisoned financial state fails fast; recovery could expose inconsistent positions.
 pub const ACTIVITY_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +58,27 @@ pub enum ActivityLevel {
     Success,
     Warning,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradeResult {
+    Skipped,
+    Paper,
+    Submitted,
+    Rejected,
+    Unknown,
+}
+
+impl TradeResult {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Skipped => "SKIPPED",
+            Self::Paper => "PAPER",
+            Self::Submitted => "SUBMITTED",
+            Self::Rejected => "REJECTED",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -228,7 +249,7 @@ pub enum OperatorEvent {
         trade: WhaleTrade,
         market: Option<Box<MarketInfo>>,
         order: Option<Box<PlannedOrder>>,
-        result: String,
+        result: TradeResult,
         reason: Option<String>,
         latency_ms: u64,
     },
@@ -419,7 +440,7 @@ fn apply_event(
                 copied_shares,
                 copied_usd_notional,
                 copy_ratio,
-                result: result.clone(),
+                result: result.label().into(),
                 reason: reason.clone(),
                 tx_hash: trade.tx_hash.clone(),
                 latency_ms,
@@ -434,15 +455,18 @@ fn apply_event(
                 .map(|value| format!(" · {value}"))
                 .unwrap_or_default();
             (
-                match result.as_str() {
-                    "SKIPPED" => ActivityLevel::Warning,
-                    "REJECTED" => ActivityLevel::Error,
+                match result {
+                    TradeResult::Skipped => ActivityLevel::Warning,
+                    TradeResult::Rejected | TradeResult::Unknown => ActivityLevel::Error,
                     _ => ActivityLevel::Success,
                 },
                 "TRADE".into(),
                 format!(
-                    "{}{} · source ${:.2} · {result} · {latency_ms}ms{reason}",
-                    market_name, copy, trade.usd_notional
+                    "{}{} · source ${:.2} · {} · {latency_ms}ms{reason}",
+                    market_name,
+                    copy,
+                    result.label(),
+                    trade.usd_notional
                 ),
             )
         }
@@ -625,6 +649,7 @@ mod tests {
             category: None,
             tags: vec![],
             side: Side::Buy,
+            neg_risk: false,
             entry_price: 0.5,
             shares: 10.0,
             usd_notional: 5.0,
@@ -681,7 +706,7 @@ mod tests {
             shares: 10.0,
             limit_price: 0.5,
             usd_notional: 5.0,
-            order_type: OrderType::Fak,
+            order_type: OrderType::Fok,
             source_trade_hash: None,
             source_shares: None,
             source_usd_notional: None,

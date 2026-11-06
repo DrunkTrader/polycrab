@@ -26,7 +26,7 @@
 //! TP/SL monitor exercises against real midprices.
 
 use crate::config::AppConfig;
-use crate::operator::{ConnectionStatus, OperatorBus, OperatorEvent, TradingMode};
+use crate::operator::{ConnectionStatus, OperatorBus, OperatorEvent, TradeResult, TradingMode};
 use crate::service::{
     market_cache::MarketCache,
     midprice::ClobMidpriceSource,
@@ -39,13 +39,16 @@ use crate::service::{
 };
 use anyhow::{anyhow, Result};
 use reqwest::Client;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 const LOG_CHANNEL_CAPACITY: usize = 256;
+const SEEN_LOG_CAPACITY: usize = 4_096;
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub async fn run(cfg: AppConfig) -> Result<()> {
     let bus = OperatorBus::new();
@@ -75,6 +78,7 @@ pub async fn run_with_operator_and_positions(
     mut shutdown: watch::Receiver<bool>,
     positions: Arc<PositionStore>,
 ) -> Result<()> {
+    cfg.ensure_live_trading_ready()?;
     let whale = cfg
         .bot
         .wallets_to_track
@@ -101,7 +105,10 @@ pub async fn run_with_operator_and_positions(
         active_wallet: whale.clone(),
     });
 
-    let http = Client::builder().user_agent("polycrab/0.1").build()?;
+    let http = Client::builder()
+        .user_agent("polycrab/0.1")
+        .timeout(NETWORK_TIMEOUT)
+        .build()?;
     let risk = RiskGuard::new(cfg.risk.clone());
     let markets = MarketCache::new(http.clone(), cfg.site.gamma_api_base.clone());
     let executor = OrderExecutor::new(
@@ -115,6 +122,7 @@ pub async fn run_with_operator_and_positions(
     let monitor = if cfg.tp_sl.enabled {
         let midprice = ClobMidpriceSource::new(http.clone(), cfg.site.clob_api_base.clone());
         let live = cfg.live_trading_allowed();
+        let (monitor_stop, monitor_shutdown) = watch::channel(false);
         let handle = position_monitor::spawn_with(
             cfg.tp_sl.clone(),
             Arc::clone(&positions),
@@ -125,13 +133,14 @@ pub async fn run_with_operator_and_positions(
             cfg.trading.order_expiration_secs,
             bus.clone(),
             shutdown.clone(),
+            monitor_shutdown,
         );
         info!(
             live_trading = live,
             poll_interval_secs = cfg.tp_sl.poll_interval_secs,
             "TP/SL monitor spawned"
         );
-        Some(handle)
+        Some((handle, monitor_stop))
     } else {
         None
     };
@@ -151,13 +160,22 @@ pub async fn run_with_operator_and_positions(
         shutdown.clone(),
     );
 
+    let mut seen_log_ids = HashSet::new();
+    let mut seen_log_order = VecDeque::new();
     loop {
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
-                if changed.is_ok() && *shutdown.borrow() {
-                    info!(open_positions = positions.len(), "shutdown signal received");
-                    break;
+                match changed {
+                    Ok(()) if *shutdown.borrow() => {
+                        info!(open_positions = positions.len(), "shutdown signal received");
+                        break;
+                    }
+                    Ok(()) => {}
+                    Err(_) => {
+                        warn!("shutdown channel closed; stopping copy-trading worker");
+                        break;
+                    }
                 }
             }
             maybe_log = rx.recv() => {
@@ -165,6 +183,11 @@ pub async fn run_with_operator_and_positions(
                     warn!("on-chain subscription channel closed");
                     break;
                 };
+                let log_id = log_identity(&log);
+                if !remember_log(&mut seen_log_ids, &mut seen_log_order, log_id.clone()) {
+                    debug!(%log_id, "duplicate polygon log skipped");
+                    continue;
+                }
                 if let Err(e) = handle_log(&executor, &whale, &log, &bus, &risk).await {
                     bus.publish(OperatorEvent::RuntimeError {
                         context: format!("trade pipeline {}", log.tx_hash),
@@ -176,9 +199,27 @@ pub async fn run_with_operator_and_positions(
         }
     }
 
-    let _ = sub.await;
-    if let Some(monitor) = monitor {
-        let _ = monitor.await;
+    if let Some((_, monitor_stop)) = monitor.as_ref() {
+        let _ = monitor_stop.send(true);
+    }
+    let mut child_failure = None;
+    if let Err(error) = sub.await {
+        bus.publish(OperatorEvent::RuntimeError {
+            context: "polygon websocket task".into(),
+            message: error.to_string(),
+        });
+        child_failure = Some(anyhow!("polygon websocket task failed: {error}"));
+    }
+    if let Some((monitor, _)) = monitor {
+        if let Err(error) = monitor.await {
+            bus.publish(OperatorEvent::RuntimeError {
+                context: "TP/SL monitor task".into(),
+                message: error.to_string(),
+            });
+            if child_failure.is_none() {
+                child_failure = Some(anyhow!("TP/SL monitor task failed: {error}"));
+            }
+        }
     }
     bus.publish(OperatorEvent::Connection {
         status: ConnectionStatus::Stopped,
@@ -187,7 +228,33 @@ pub async fn run_with_operator_and_positions(
     bus.publish(OperatorEvent::BotStopped {
         detail: format!("{} local position(s) remaining", positions.len()),
     });
-    Ok(())
+    child_failure.map_or(Ok(()), Err)
+}
+
+fn log_identity(log: &RawLog) -> String {
+    match log.log_index {
+        Some(index) => format!("{}:{index}", log.tx_hash),
+        None => format!(
+            "{}:{}:{}:{}",
+            log.tx_hash,
+            log.address,
+            log.topics.join(","),
+            log.data
+        ),
+    }
+}
+
+fn remember_log(seen: &mut HashSet<String>, order: &mut VecDeque<String>, id: String) -> bool {
+    if !seen.insert(id.clone()) {
+        return false;
+    }
+    order.push_back(id);
+    while order.len() > SEEN_LOG_CAPACITY {
+        if let Some(expired) = order.pop_front() {
+            seen.remove(&expired);
+        }
+    }
+    true
 }
 
 async fn handle_log(
@@ -239,7 +306,7 @@ async fn handle_log(
             ?r,
             "execution skipped"
             );
-            ("SKIPPED".into(), None, Some(reason))
+            (TradeResult::Skipped, None, Some(reason))
         }
         ExecutionOutcome::DryRun(order) => {
             bus.publish(OperatorEvent::OrderSimulated(order.clone()));
@@ -253,7 +320,7 @@ async fn handle_log(
             usd = order.usd_notional,
             "simulated order recorded (not signed or submitted)"
             );
-            ("PAPER".into(), Some(order), None)
+            (TradeResult::Paper, Some(order), None)
         }
         ExecutionOutcome::Submitted {
             order,
@@ -267,21 +334,29 @@ async fn handle_log(
                 success,
                 detail: detail.clone(),
             });
-            if success {
-                if let Some(position) = executor.positions().get(&trade.token_id) {
-                    bus.publish(OperatorEvent::PositionOpened(position));
-                }
-            }
             info!(
                 order_id = ?order_id,
                 success,
                 "order submitted to Polymarket CLOB"
             );
             if success {
-                ("SUBMITTED".into(), Some(order), None)
+                (TradeResult::Submitted, Some(order), None)
             } else {
-                ("REJECTED".into(), Some(order), Some(detail))
+                (TradeResult::Rejected, Some(order), Some(detail))
             }
+        }
+        ExecutionOutcome::UnknownSubmission { order, detail } => {
+            bus.publish(OperatorEvent::OrderResponse {
+                token_id: trade.token_id.clone(),
+                order_id: None,
+                success: false,
+                detail: detail.clone(),
+            });
+            warn!(
+                token = %trade.token_id,
+                "CLOB submission outcome is unknown; no automatic retry"
+            );
+            (TradeResult::Unknown, Some(order), Some(detail))
         }
     };
     let market = executor.cached_market(&trade.token_id);
@@ -345,5 +420,56 @@ mod tests {
             filter.topics[2],
             Some(vec![pad_address_to_topic(whale).unwrap()])
         );
+    }
+
+    #[test]
+    fn duplicate_log_identity_is_ignored_with_a_bounded_set() {
+        let log = RawLog {
+            address: "0xexchange".into(),
+            topics: vec!["0xtopic".into()],
+            data: "0xdata".into(),
+            tx_hash: "0xtx".into(),
+            block_number: 1,
+            log_index: Some(2),
+        };
+        let id = log_identity(&log);
+        let mut seen = HashSet::new();
+        let mut order = VecDeque::new();
+        assert!(remember_log(&mut seen, &mut order, id.clone()));
+        assert!(!remember_log(&mut seen, &mut order, id));
+    }
+
+    #[test]
+    fn log_index_distinguishes_events_in_one_transaction() {
+        let first = RawLog {
+            address: "0xexchange".into(),
+            topics: vec!["0xtopic".into()],
+            data: "0xdata".into(),
+            tx_hash: "0xtx".into(),
+            block_number: 1,
+            log_index: Some(2),
+        };
+        let second = RawLog {
+            log_index: Some(3),
+            ..first.clone()
+        };
+        assert_ne!(log_identity(&first), log_identity(&second));
+    }
+
+    #[test]
+    fn fallback_identity_distinguishes_logs_without_log_index() {
+        let first = RawLog {
+            address: "0xexchange".into(),
+            topics: vec!["0xtopic".into()],
+            data: "0xfirst".into(),
+            tx_hash: "0xtx".into(),
+            block_number: 1,
+            log_index: None,
+        };
+        let second = RawLog {
+            data: "0xsecond".into(),
+            ..first.clone()
+        };
+        assert_ne!(log_identity(&first), log_identity(&second));
     }
 }

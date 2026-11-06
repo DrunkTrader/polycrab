@@ -23,6 +23,7 @@ git clone https://github.com/DrunkTrader/polycrab.git
 cd polycrab
 cargo fetch --locked
 make test
+cargo run --locked -- validate-config
 ```
 
 The committed [`config.json`](../config.json) is already configured for

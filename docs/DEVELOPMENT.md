@@ -60,6 +60,13 @@ headless Copy Trading with:
 cargo run --release --locked -- run copy-trading
 ```
 
+Validate configuration without starting a worker or connecting to an external
+service:
+
+```bash
+cargo run --locked -- validate-config
+```
+
 Run the terminal dashboard with `cargo run --release --locked -- tui`.
 
 ## Dashboard controls

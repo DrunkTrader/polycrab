@@ -14,6 +14,9 @@ cargo fetch --locked
 # Offline unit and documentation tests
 make test
 
+# Per-trade hot-path timings (release build, no network)
+make bench
+
 # Formatting and lint checks
 make fmt-check
 make lint

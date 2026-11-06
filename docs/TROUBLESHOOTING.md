@@ -12,6 +12,15 @@ polycrab --config /path/to/config.json run copy-trading
 The public JSON file is always required. The private credentials file is
 optional in simulated mode.
 
+## Validate configuration without starting the worker
+
+Use the side-effect-free validation command. It checks settings and reports the
+configured mode without printing credential values:
+
+```bash
+polycrab validate-config
+```
+
 ## Live mode reports missing credentials
 
 Confirm that the credentials YAML or environment overrides provide a valid

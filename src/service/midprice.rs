@@ -31,13 +31,38 @@ impl ClobMidpriceSource {
             .error_for_status()?
             .json::<MidpointResponse>()
             .await?;
-        resp.mid
-            .parse::<f64>()
-            .map_err(|e| anyhow!("midpoint not a float: {e}"))
+        parse_midpoint(&resp.mid)
     }
+}
+
+fn parse_midpoint(raw: &str) -> Result<f64> {
+    let midpoint = raw
+        .parse::<f64>()
+        .map_err(|e| anyhow!("midpoint not a float: {e}"))?;
+    if !midpoint.is_finite() {
+        return Err(anyhow!("midpoint must be finite"));
+    }
+    Ok(midpoint)
 }
 
 #[derive(Debug, Deserialize)]
 struct MidpointResponse {
     mid: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_midpoint;
+
+    #[test]
+    fn parses_finite_midpoint() {
+        assert_eq!(parse_midpoint("0.42").unwrap(), 0.42);
+    }
+
+    #[test]
+    fn rejects_non_finite_midpoint() {
+        for value in ["NaN", "inf", "-inf"] {
+            assert!(parse_midpoint(value).is_err(), "accepted {value}");
+        }
+    }
 }

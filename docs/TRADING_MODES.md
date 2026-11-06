@@ -9,7 +9,7 @@ polls midpoints, but it does not sign or submit orders.
 | Mode | Required flags | Behavior |
 |---|---|---|
 | Simulated | `enable_trading: false` **or** `mock_trading: true` | Planned entries and exits are recorded in the in-memory position store. No private key or CLOB credentials are required. |
-| Live | `enable_trading: true` **and** `mock_trading: false` | Orders are signed locally with EIP-712 and submitted to the configured Polymarket CLOB. Private-key, funder, and L2 credentials are required. |
+| Live | `enable_trading: true` **and** `mock_trading: false` | The configuration expresses a live request, but the current binary rejects startup until depth enforcement and fill reconciliation are available. No orders are signed or submitted. |
 
 Changing `enable_trading` alone does not enable live execution. Keep both
 settings at their shipped safe values until a complete simulated session has
@@ -28,15 +28,17 @@ been reviewed.
 - Positions and P&L are session-local and are not reconciled with the account
   after restart.
 - A successful CLOB HTTP response is not a confirmed exchange fill.
+- An accepted live submission must remain pending until a confirmed fill; HTTP
+  acceptance does not create a local position.
 - Stopping PolyCrab does not cancel orders already submitted to the CLOB.
 
 ## Risk boundaries
 
 The executor applies market allow/block rules, category/tag exposure caps,
-minimum and maximum sizing, and the in-memory large-trade circuit breaker. The
-configured `risk.min_depth_usd` value is covered by risk-module tests, but a
-production order-book provider is not connected. When a large trade requests a
-book check, the executor warns and continues.
+minimum and maximum sizing, and the in-memory large-trade circuit breaker. No
+production order-book provider is connected, so a large trade is reported as
+depth-unverified: the executor blocks the live path and keeps simulated mode
+usable.
 
 See [Configuration](CONFIGURATION.md) for the exact flag and risk fields, and
 [Security](SECURITY.md) before using live credentials.

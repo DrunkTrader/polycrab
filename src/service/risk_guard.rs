@@ -1,16 +1,15 @@
-//! Circuit breaker + orderbook depth guard.
+//! Circuit breaker for the hot path.
 //!
-//! Two layers of protection on the hot path:
-//! 1. **Fast check** — counts consecutive large trades per outcome token
-//!    within a rolling window. Trips synchronously without any I/O.
-//! 2. **Slow check** — when the fast check requests it, fetches the orderbook
-//!    and validates that depth on the relevant side meets `min_depth_usd`.
+//! Counts consecutive large trades per outcome token within a rolling window
+//! and trips synchronously without any I/O. A single large trade is reported
+//! as [`RiskCheck::DepthUnverified`]: there is no order-book provider, so the
+//! caller decides whether to continue (paper) or fail closed (live).
 //!
-//! Both checks honour `trip_duration_secs`: once the breaker fires, every
-//! subsequent decision is blocked until the cooldown elapses.
+//! The breaker honours `trip_duration_secs`: once it fires, every subsequent
+//! decision is blocked until the cooldown elapses.
 
 use crate::config::RiskConfig;
-use crate::models::{BookSnapshot, Side, WhaleTrade};
+use crate::models::WhaleTrade;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,8 +17,9 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RiskCheck {
     Allow,
-    /// Require a book fetch + `check_with_book` before allowing.
-    FetchBook,
+    /// Large trade with no order-book depth behind it. Live callers must fail
+    /// closed; paper callers may continue.
+    DepthUnverified,
     Block(BlockReason),
 }
 
@@ -27,7 +27,7 @@ pub enum RiskCheck {
 pub enum BlockReason {
     Tripped,
     ConsecutiveLargeTrades,
-    InsufficientDepth,
+    BookUnavailable,
 }
 
 #[derive(Debug)]
@@ -81,6 +81,14 @@ impl RiskGuard {
         }
 
         let window = Duration::from_secs(self.cfg.sequence_window_secs);
+        // Drop buckets whose newest entry is already expired, so the map does
+        // not retain one key per token seen over the life of the process.
+        g.history.retain(|_, bucket| {
+            bucket
+                .back()
+                .map(|&last| now.duration_since(last) <= window)
+                .unwrap_or(false)
+        });
         let bucket = g.history.entry(trade.token_id.clone()).or_default();
 
         // Drop expired entries from the head.
@@ -99,27 +107,16 @@ impl RiskGuard {
             return RiskCheck::Block(BlockReason::ConsecutiveLargeTrades);
         }
 
-        // Large trade — pulse the book check before allowing.
-        RiskCheck::FetchBook
+        // Large trade with no depth data behind it — let the caller decide.
+        RiskCheck::DepthUnverified
     }
 
-    /// Phase two, after the caller has fetched the book.
-    pub fn check_with_book(&self, book: &BookSnapshot, side: Side) -> RiskCheck {
-        let depth = book.depth_usd(side, 5);
-        if depth < self.cfg.min_depth_usd {
-            self.trip(BlockReason::InsufficientDepth);
-            RiskCheck::Block(BlockReason::InsufficientDepth)
-        } else {
-            RiskCheck::Allow
-        }
-    }
-
-    /// Manual trip — e.g. when a book fetch fails, prefer tripping
-    /// to firing blind.
-    pub fn trip(&self, _reason: BlockReason) {
+    /// Manual trip — e.g. when depth cannot be verified, prefer tripping to
+    /// firing blind.
+    pub fn trip(&self, reason: BlockReason) {
         let mut g = self.inner.lock().unwrap();
         g.tripped_until = Some(Instant::now() + Duration::from_secs(self.cfg.trip_duration_secs));
-        g.trip_reason = Some(_reason);
+        g.trip_reason = Some(reason);
     }
 
     pub fn is_tripped(&self) -> bool {
@@ -154,7 +151,6 @@ mod tests {
             large_trade_shares: 1000.0,
             consecutive_trigger: 2,
             sequence_window_secs: 30,
-            min_depth_usd: 200.0,
             trip_duration_secs: 60,
         }
     }
@@ -182,9 +178,9 @@ mod tests {
     }
 
     #[test]
-    fn first_large_requests_book() {
+    fn first_large_reports_unverified_depth() {
         let g = RiskGuard::new(cfg());
-        assert_eq!(g.check_fast(&trade(2000.0)), RiskCheck::FetchBook);
+        assert_eq!(g.check_fast(&trade(2000.0)), RiskCheck::DepthUnverified);
     }
 
     #[test]
@@ -204,16 +200,16 @@ mod tests {
     }
 
     #[test]
-    fn depth_check_blocks_thin_book() {
-        let g = RiskGuard::new(cfg());
-        let book = BookSnapshot {
-            bids: vec![],
-            asks: vec![crate::models::BookLevel {
-                price: 0.5,
-                size: 10.0,
-            }],
-        };
-        let r = g.check_with_book(&book, Side::Buy);
-        assert_eq!(r, RiskCheck::Block(BlockReason::InsufficientDepth));
+    fn expired_token_history_is_dropped_instead_of_growing() {
+        let mut config = cfg();
+        config.sequence_window_secs = 0; // every prior entry is already expired
+        let g = RiskGuard::new(config);
+        for token in 0..50 {
+            let mut t = trade(2000.0);
+            t.token_id = format!("tok-{token}");
+            assert_eq!(g.check_fast(&t), RiskCheck::DepthUnverified);
+        }
+        // Only the token from the most recent call is retained.
+        assert_eq!(g.inner.lock().unwrap().history.len(), 1);
     }
 }

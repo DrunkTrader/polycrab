@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 const DEFAULT_TTL: Duration = Duration::from_secs(300);
+const MAX_ENTRIES: usize = 2_048;
 
 #[derive(Debug, Clone)]
 pub struct MarketInfo {
@@ -25,6 +26,9 @@ pub struct MarketInfo {
     pub tags: Vec<String>,
     pub closed: bool,
     pub expiry: Option<DateTime<Utc>>,
+    /// Neg-risk markets settle on a different exchange contract, so orders for
+    /// them must be EIP-712 signed against `neg_risk_exchange_address`.
+    pub neg_risk: bool,
 }
 
 impl MarketInfo {
@@ -109,9 +113,20 @@ impl MarketCache {
     fn insert(&self, info: MarketInfo) {
         let mut e = self.entries.write().unwrap();
         let mut t = self.token_index.write().unwrap();
+        let replacing = e.contains_key(&info.slug);
         t.insert(info.yes_token_id.clone(), info.slug.clone());
         t.insert(info.no_token_id.clone(), info.slug.clone());
         e.insert(info.slug.clone(), (info, Instant::now()));
+        if !replacing && e.len() > MAX_ENTRIES {
+            if let Some(oldest) = e
+                .iter()
+                .min_by_key(|(_, (_, fetched_at))| *fetched_at)
+                .map(|(slug, _)| slug.clone())
+            {
+                e.remove(&oldest);
+                t.retain(|_, slug| slug != &oldest);
+            }
+        }
     }
 
     async fn fetch_by_token(&self, token_id: &str) -> Result<MarketInfo> {
@@ -167,6 +182,14 @@ fn parse_market(m: &serde_json::Value) -> Result<MarketInfo> {
         .and_then(|v| v.as_str())
         .map(str::to_string);
     let closed = m.get("closed").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Gamma spells this `negRisk`; older payloads use `neg_risk`. Absent means
+    // a standard market, which is the safe default: a mis-signed neg-risk order
+    // is rejected by the venue rather than filled on the wrong contract.
+    let neg_risk = m
+        .get("negRisk")
+        .or_else(|| m.get("neg_risk"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let expiry = m
         .get("endDate")
         .or_else(|| m.get("end_date"))
@@ -227,6 +250,7 @@ fn parse_market(m: &serde_json::Value) -> Result<MarketInfo> {
         tags,
         closed,
         expiry,
+        neg_risk,
     })
 }
 
@@ -259,5 +283,26 @@ mod tests {
         assert_eq!(market.outcome_for_token("no"), Some("NO"));
         assert_eq!(market.tags, vec!["Solana"]);
         assert!(market.expiry.is_some());
+        assert!(!market.neg_risk);
+    }
+
+    #[test]
+    fn reads_neg_risk_flag_in_both_spellings() {
+        let base = serde_json::json!({
+            "slug": "s",
+            "question": "q",
+            "clobTokenIds": ["yes", "no"],
+        });
+
+        let mut camel = base.clone();
+        camel["negRisk"] = serde_json::json!(true);
+        assert!(parse_market(&camel).unwrap().neg_risk);
+
+        let mut snake = base.clone();
+        snake["neg_risk"] = serde_json::json!(true);
+        assert!(parse_market(&snake).unwrap().neg_risk);
+
+        // Missing flag must not be guessed as neg-risk.
+        assert!(!parse_market(&base).unwrap().neg_risk);
     }
 }
